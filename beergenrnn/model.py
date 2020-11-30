@@ -31,9 +31,10 @@ class Meter:
         if isinstance(other, dict):
             for k, v in other.items():
                 if k in self.metrics:
-                    self.metrics[k].extend(v) if isinstance(v, list) else self.metrics[
-                        k
-                    ].append(v)
+                    if isinstance(v, list):
+                        self.metrics[k].extend(v)
+                    else:
+                        self.metrics[k].append(v)
                 else:
                     self.metrics[k] = v if isinstance(v, list) else [v]
         else:
@@ -41,7 +42,7 @@ class Meter:
 
         return self
 
-    def mean(self):
+    def mean(self) -> Dict[str, float]:
         return {k: np.mean(v) for k, v in self.metrics.items()}
 
 
@@ -72,18 +73,22 @@ class Model(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.emb = nn.Embedding(num_embeddings, embedding_dim, padding_idx=0)
-        self.rnn = nn.RNN(embedding_dim, hidden_dim, n_layers, batch_first=True)
+        self.rnn = nn.LSTM(embedding_dim, hidden_dim, n_layers, batch_first=True)
         self.heads = Heads(hidden_dim, output_sizes)
 
-    def forward(self, x, hidden: Optional[T] = None) -> Tuple[List[T], T]:
-        if hidden is None:
-            hidden = torch.zeros(self.n_layers, x.size(0), self.hidden_dim).to(x.device)
+    def forward(self, x, hidden: Optional[T] = None) -> Tuple[List[T], Tuple[T, T]]:
+        # if hidden is None:
+        #     hidden = torch.zeros(self.n_layers, x.size(0), self.hidden_dim).to(x.device)
 
         # Get RNN output
         x = self.emb(x)
-        out, hidden = self.rnn(x, hidden)
+        if hidden is None:
+            out, (hn, cn) = self.rnn(x)
+        else:
+            out, (hn, cn) = self.rnn(x, hidden)
+        # print(out.shape, hn.shape, cn.shape)
         out = self.heads(out)
-        return out, hidden
+        return out, (hn, cn)
 
 
 class RecipeModel(nn.Module):
@@ -131,33 +136,40 @@ class RecipeModel(nn.Module):
         # Predict yeast name and amount
         self.yeast_model = Heads(
             in_features=hidden_dim,
-            output_sizes=[n_yeasts, 1],
+            output_sizes=[n_yeasts],
         )
 
     def forward(self, x: Dict[str, T]) -> Tuple[List[T], List[T], List[T], T]:
 
         # Get hidden state from style embeddings
-        hidden = self.style_model(x["style_name"].long()).transpose(0, 1)
-        style = hidden
+        style = self.style_model(x["style_name"].long()).transpose(0, 1)
 
         # Collect outputs from all the models
-        out_fermentables, hidden = self.fermentables_model(
-            x["fermentables_name"].long(), hidden
+        out_fermentables, (hn, cn) = self.fermentables_model(
+            x["fermentables_name"].long(), (style, torch.zeros_like(style))
         )
-        out_hops, hidden = self.hops_model(x["hops_name"].long(), hidden + style)
-        out_yeasts = self.yeast_model((hidden + style).transpose(0, 1))
+        # print([o.shape for o in out_fermentables], hn.shape, cn.shape, style.shape)
+        out_hops, (hn, cn) = self.hops_model(x["hops_name"].long(), (hn + style, cn))
+        out_yeasts = self.yeast_model((hn + style).transpose(0, 1))
 
-        return out_fermentables, out_hops, out_yeasts, hidden
+        return out_fermentables, out_hops, out_yeasts, hn
 
-    def generate(self, style: Optional[int] = None, max_steps: int = 16):
+    def generate(
+        self,
+        style: Optional[int] = None,
+        max_steps: int = 16,
+        deterministic: bool = True,
+    ):
+        self.eval()
         if style is None:
             hidden = torch.zeros(self.n_layers, 1, self.hidden_dim)
         else:
             hidden = self.style_model(torch.tensor(style).reshape(1, 1))
+        hidden = (hidden, torch.zeros_like(hidden))
 
         # TODO take actual start and end token
         start = torch.tensor(1).reshape(1, 1)
-        end = torch.tensor(2).reshape(1, 1)
+        end = [torch.tensor(2).reshape(1, 1), torch.tensor(0).reshape(1, 1)]
 
         output = {
             "fermentables_name": [],
@@ -167,18 +179,25 @@ class RecipeModel(nn.Module):
             "hops_time": [],
             "hops_use": [],
             "yeasts_name": [],
-            "yeasts_amount": [],
         }
 
         out = start.clone()
         step = 0
         while step < max_steps:
             out, hidden = self.fermentables_model(out, hidden)
-            cat = torch.argmax(out[0].squeeze()).detach()
-            if cat.reshape(1, 1) == end:
+            cat_prob = torch.softmax(out[0].squeeze(), dim=-1).detach()
+            if deterministic:
+                cat = torch.argmax(cat_prob)
+            else:
+                cat = torch.tensor(
+                    np.random.choice(cat_prob.size(0), p=cat_prob.numpy())
+                )
+            if cat.reshape(1, 1) in end:
                 break
             output["fermentables_name"].append(cat.numpy())
-            output["fermentables_amount"].append(out[1].detach().numpy().squeeze())
+            output["fermentables_amount"].append(
+                torch.clamp(out[1], min=0).detach().numpy().squeeze()
+            )
             step += 1
             out = cat.reshape(1, 1)
 
@@ -187,7 +206,7 @@ class RecipeModel(nn.Module):
         while step < max_steps:
             out, hidden = self.hops_model(out, hidden)
             cat = torch.argmax(out[0].squeeze()).detach()
-            if cat.reshape(1, 1) == end:
+            if cat.reshape(1, 1) in end:
                 break
             output["hops_name"].append(cat.numpy())
             output["hops_use"].append(torch.argmax(out[1].squeeze()).detach().numpy())
@@ -196,9 +215,8 @@ class RecipeModel(nn.Module):
             step += 1
             out = cat.reshape(1, 1)
 
-        out = self.yeast_model(hidden.transpose(0, 1))
+        out = self.yeast_model(hidden[0].transpose(0, 1))
         output["yeasts_name"].append(torch.argmax(out[0].squeeze()).detach().numpy())
-        output["yeasts_amount"].append(out[1].detach().numpy().squeeze())
 
         output = {k: np.array(v) for k, v in output.items()}
         return output
@@ -267,16 +285,12 @@ class Trainer(nn.Module):
         loss_reg_hops_time = self.criterion_reg(
             out_hops[-2][..., :-1].squeeze(), batch["hops_time"][:, 1:]
         )
-        loss_reg_yeast_amt = self.criterion_reg(
-            out_yeasts[-1].squeeze(), batch["yeasts_amount"].squeeze()
-        )
 
         # Combine all
         loss_clf = loss_clf_mash + loss_clf_hops + loss_clf_hops_uses + loss_clf_yeasts
         loss_reg = (
-            loss_reg_mash_amt
-            + loss_reg_hops_amt
-            + loss_reg_yeast_amt
+            loss_reg_mash_amt * 10
+            + loss_reg_hops_amt  # TODO tune coefficient for hops
             + loss_reg_hops_time
         )
 
@@ -291,7 +305,6 @@ class Trainer(nn.Module):
             "loss_reg_mash_amt": loss_reg_mash_amt.item(),
             "loss_reg_hops_amt": loss_reg_hops_amt.item(),
             "loss_reg_hops_time": loss_reg_hops_time.item(),
-            "loss_reg_yeast_amt": loss_reg_yeast_amt.item(),
             "loss": loss.item(),
         }
 
@@ -304,8 +317,8 @@ class Trainer(nn.Module):
         loader_valid: Optional[DataLoader] = None,
     ):
         meter = Meter()
-        for i in trange(n_epochs):
-            meter += self.one_epoch(loader_train)
+        for epoch in trange(n_epochs):
+            meter += self.one_epoch(loader_train, epoch=epoch)
             torch.save(
                 self.model.state_dict(),
                 os.path.join("../checkpoints", self.name) + ".pth",

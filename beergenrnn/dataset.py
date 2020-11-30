@@ -27,7 +27,7 @@ def tag_to_dict_list(
 
 def time_to_float_hours(time_str: str, max_time: float = 2.0):
     """
-    Converts time from minutes to hours, clips dry hop time to 2
+    Converts time from minutes to hours, clips dry hop time to max_time
     :param time_str:
     :param max_time:
     :return:
@@ -40,6 +40,7 @@ class RecipeDataset(Dataset):
     path: Union[Path, str] = "../data/brewdog"
     max_len: int = 16
     dicts: Optional[Dict[str, Dict[str, int]]] = None
+    normalize_prop: str = "batch_size"
 
     def __post_init__(self):
         self.path = Path(self.path)
@@ -60,16 +61,26 @@ class RecipeDataset(Dataset):
         """
         # read BeerXML
         root = ET.parse(self.recipe_paths[i]).getroot()
+        properties = {
+            k: float(root[0].findall(k.upper())[0].text)
+            for k in ["batch_size", "boil_size", "boil_time", "efficiency"]
+        }
+
         item = dict()
         ingredients_to_read = {
             "hops": {
                 "name": str,
-                "amount": float,
+                "amount": lambda x: float(x)
+                / properties[self.normalize_prop]
+                * 1000,  # to g/l
                 "time": time_to_float_hours,
                 "use": str,
             },
-            "fermentables": {"name": str, "amount": float},
-            "yeasts": {"name": str, "amount": float},
+            "fermentables": {
+                "name": str,
+                "amount": lambda x: float(x) / properties[self.normalize_prop],
+            },  # to kg/l
+            "yeasts": {"name": str},
         }
 
         for ingredient, convert in ingredients_to_read.items():
