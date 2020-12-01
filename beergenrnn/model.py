@@ -181,6 +181,7 @@ class RecipeModel(nn.Module):
         else:
             hn = self.style_model(torch.tensor(style).reshape(1, 1).to(device))
         cn = torch.zeros_like(hn).to(device)
+        style = hn.clone()
 
         # TODO take actual start and end token
         start = torch.tensor(1).reshape(1, 1).to(device)
@@ -219,7 +220,7 @@ class RecipeModel(nn.Module):
         out = start.clone()
         step = 0
         while step < max_steps:
-            out, hn, cn, emb = self.hops_model(out, (hn, cn))
+            out, hn, cn, emb = self.hops_model(out, (hn + style, cn))
             cat_prob = torch.softmax(out[0].squeeze(), dim=-1).detach().cpu()
             if deterministic:
                 cat = torch.argmax(cat_prob)
@@ -245,7 +246,7 @@ class RecipeModel(nn.Module):
         out = start.clone()
         step = 0
         while step < max_steps:
-            out, hn, cn, emb = self.yeast_model(out, (hn, cn))
+            out, hn, cn, emb = self.yeast_model(out, (hn + style, cn))
             cat = torch.argmax(out[0].squeeze()).detach().cpu()
             if cat.reshape(1, 1) in end:
                 break
@@ -310,7 +311,9 @@ class Trainer(nn.Module):
         loss_clf_hops_uses = self.criterion_clf(
             out_hops[1][..., :-1], batch["hops_use"][:, 1:].long()
         )
-        loss_clf_yeasts = self.criterion_clf(out_yeasts[0], batch["yeasts_name"].long())
+        loss_clf_yeasts = self.criterion_clf(
+            out_yeasts[0][..., :-1], batch["yeasts_name"][:, 1:].long()
+        )
 
         # Regression losses
         loss_reg_mash_amt = self.criterion_reg(
@@ -357,11 +360,15 @@ class Trainer(nn.Module):
         meter = Meter()
         iterator = trange(n_epochs)
         for epoch in iterator:
-            meter += self.one_epoch(loader_train, epoch=epoch)
-            torch.save(
-                self.model.state_dict(),
-                os.path.join("../checkpoints", self.name) + ".pth",
-            )
-            iterator.set_postfix(**meter.last())
+            try:
+                meter += self.one_epoch(loader_train, epoch=epoch)
+                torch.save(
+                    self.model.state_dict(),
+                    os.path.join("../checkpoints", self.name) + ".pth",
+                )
+                iterator.set_postfix(**meter.last())
+            except KeyboardInterrupt:
+                print("Interrupted")
+                break
 
         return meter.metrics
