@@ -1,6 +1,8 @@
+import json
 import os
+import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 from xml.etree.ElementTree import Element
@@ -35,10 +37,19 @@ def time_to_float_hours(time_str: str, max_time: float = 2.0):
     return min(float(time_str) / 60, max_time)
 
 
+def process_str_name(name: str):
+    name = str(name).lower().strip()
+    name = re.sub("[^\w\s]", "", name)
+    name = re.sub(" +", " ", name)
+    return name
+
+
 @dataclass
 class RecipeDataset(Dataset):
     path: Union[Path, str] = "../data/brewdog"
-    max_len: int = 16
+    max_len: Dict[str, int] = field(
+        default_factory=lambda: {"hops": 16, "fermentables": 16, "yeasts": 4}
+    )
     dicts: Optional[Dict[str, Dict[str, int]]] = None
     normalize_prop: str = "batch_size"
 
@@ -46,7 +57,15 @@ class RecipeDataset(Dataset):
         self.path = Path(self.path)
         self.recipe_paths = list(self.path.glob("*.xml"))
         if self.dicts is None:
-            self.dicts = self._build_dicts()
+            path_dicts = self.path / "dicts.json"
+            if path_dicts.exists():
+                print(f"Load existing dicts from {path_dicts}")
+                with open(path_dicts, "r") as f:
+                    self.dicts = json.load(f)
+            else:
+                self.dicts = self._build_dicts()
+                with open(path_dicts, "w") as f:
+                    json.dump(self.dicts, f)
 
     def __len__(self):
         return len(self.recipe_paths)
@@ -69,18 +88,19 @@ class RecipeDataset(Dataset):
         item = dict()
         ingredients_to_read = {
             "hops": {
-                "name": str,
+                "name": process_str_name,
                 "amount": lambda x: float(x)
                 / properties[self.normalize_prop]
                 * 1000,  # to g/l
                 "time": time_to_float_hours,
-                "use": str,
+                "use": process_str_name,
             },
             "fermentables": {
-                "name": str,
+                "name": process_str_name,
                 "amount": lambda x: float(x) / properties[self.normalize_prop],
             },  # to kg/l
-            "yeasts": {"name": str},
+            "yeasts": {"name": process_str_name},
+            # "style": {"name": process_str_name, "category": process_str_name}
         }
 
         for ingredient, convert in ingredients_to_read.items():
@@ -92,7 +112,7 @@ class RecipeDataset(Dataset):
             item = {
                 f"{kind}_{prop}": [ingredient[prop] for ingredient in ingredient_list]
                 for kind, ingredient_list in item.items()
-                for prop in ingredient_list[0].keys()
+                for prop in ingredients_to_read[kind].keys()
             }
         except IndexError:
             print(i, self.recipe_paths[i])
@@ -100,7 +120,13 @@ class RecipeDataset(Dataset):
             raise
 
         # Add style info
-        item["style_name"] = [root[0].findall("STYLE")[0][1].text]
+        # TODO move to convert constructor
+        item["style_name"] = [
+            process_str_name(root[0].findall("STYLE")[0].findall("NAME")[0].text)
+        ]
+        item["style_category"] = [
+            process_str_name(root[0].findall("STYLE")[0].findall("CATEGORY")[0].text)
+        ]
         return item
 
     def __getitem__(self, i: int):
@@ -109,18 +135,21 @@ class RecipeDataset(Dataset):
             if k in self.dicts:
                 item[k] = [self.dicts[k][v] for v in value_list]
 
+            else:
+                item[k] = value_list
+
             # Pad hops and fermentables
             ingredient, prop = k.split("_")
-            if ingredient in ("hops", "fermentables"):
-                if prop not in ("name", "use"):
+            if ingredient in ("hops", "fermentables", "yeasts"):
+                if prop not in ("name", "use") or k not in self.dicts:
                     item[k] = [0] + item[k] + [0]
                 else:
                     item[k] = (
                         [self.dicts[k]["<start>"]] + item[k] + [self.dicts[k]["<end>"]]
                     )
                 item[k] = np.pad(
-                    item[k][: self.max_len],
-                    (0, max(0, self.max_len - len(item[k]))),
+                    item[k][: self.max_len[ingredient]],
+                    (0, max(0, self.max_len[ingredient] - len(item[k]))),
                     constant_values=0,
                 )
             else:
@@ -129,14 +158,14 @@ class RecipeDataset(Dataset):
         return item
 
     def _build_dicts(
-        self, ends: Tuple[str] = ("name", "use", "style")
+        self, ends: Tuple[str] = ("name", "use", "category")
     ) -> Dict[str, Dict[str, int]]:
         """
         Builds dicts for numerical encoding of all the categorical values in the data
         :param ends: ends of field names to encode
         :return: dict of dicts variable -> name -> encoding
         """
-        items = [self._get_dict(i) for i in range(len(self))]
+        items = [self._get_dict(i) for i in trange(len(self))]
         dicts = {k: v for k, v in items[0].items() if k.split("_")[-1] in ends}
         for item in items[1:]:
             for key, value_list in item.items():
@@ -146,7 +175,7 @@ class RecipeDataset(Dataset):
         for key, value_list in dicts.items():
             unique = sorted(set(value_list))
             dicts[key] = {v: i + 3 for i, v in enumerate(unique)}
-            if key != "style_name":
+            if not key.startswith("style"):
                 dicts[key].update({"<pad>": 0, "<start>": 1, "<end>": 2})
 
         return dicts
